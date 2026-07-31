@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server as brain
 
 from mcp.server.mcpserver import MCPServer
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -154,9 +153,31 @@ def run_command(tool: str, args: list[str], command_secret: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
-class LockdownMiddleware(BaseHTTPMiddleware):
+class LockdownMiddleware:
+    """Path lockdown + per-IP rate limiting, as *pure ASGI* middleware.
+
+    Deliberately NOT starlette.middleware.base.BaseHTTPMiddleware.
+
+    BaseHTTPMiddleware wraps the downstream app in a task whose response is
+    consumed through an anyio stream, which means it does not forward the
+    response start until the body begins flowing. For a long-lived streaming
+    response that is correct-but-fatal: MCP's Streamable-HTTP transport opens
+    a server->client SSE stream on GET /<secret>/mcp that stays open and sends
+    nothing until there is a message to push. Under BaseHTTPMiddleware the
+    client therefore receives *no response headers at all* and simply hangs
+    (observed: curl reporting http=000 after a 15s timeout, and every MCP
+    client stalling ~5.5s on connect before giving up on the GET stream).
+
+    Reproduced against the Cloud Run URL directly, so it was never the
+    Cloudflare Tunnel. POST was unaffected because in stateless_http mode it
+    returns a single complete JSON body.
+
+    Pure ASGI middleware passes `send` straight through, so response start is
+    forwarded the moment the app emits it and SSE streams immediately.
+    """
+
     def __init__(self, app):
-        super().__init__(app)
+        self.app = app
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._prefix = f"/{SECRET}"
 
@@ -177,21 +198,37 @@ class LockdownMiddleware(BaseHTTPMiddleware):
         q.append(now)
         return True
 
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path or "/"
+    async def __call__(self, scope, receive, send):
+        # Let non-HTTP scopes (lifespan, websocket) through untouched.
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path") or "/"
+
         # only secret tree is reachable; everything else 404
         if path != "/" and not path.startswith(self._prefix):
-            return JSONResponse({"error": "not_found"}, status_code=404)
+            await JSONResponse({"error": "not_found"}, status_code=404)(
+                scope, receive, send
+            )
+            return
 
+        request = Request(scope, receive=receive)
         ip = self._client_ip(request)
         if not self._rate_ok(ip):
-            return JSONResponse({"error": "rate_limited"}, status_code=429)
+            await JSONResponse({"error": "rate_limited"}, status_code=429)(
+                scope, receive, send
+            )
+            return
 
         # block obvious probes on /
         if path == "/":
-            return JSONResponse({"error": "not_found"}, status_code=404)
+            await JSONResponse({"error": "not_found"}, status_code=404)(
+                scope, receive, send
+            )
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 if __name__ == "__main__":
