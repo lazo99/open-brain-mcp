@@ -10,10 +10,10 @@ from typing import Any
 
 import numpy as np
 import psycopg
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from psycopg.rows import dict_row
 
-mcp = FastMCP("open-brain")
+mcp = MCPServer("open-brain")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
